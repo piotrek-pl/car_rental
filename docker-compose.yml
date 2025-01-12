@@ -1,0 +1,30 @@
+version: '3.8'
+
+services:
+  db:
+    image: postgres:15
+    restart: always
+    environment:
+      POSTGRES_USER: car_rental_user
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: car_rental_db
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+
+  web:
+    build: .
+    command: flask run --host=0.0.0.0
+    volumes:
+      - .:/app
+    ports:
+      - "5000:5000"
+    env_file: 
+      - .env 
+    depends_on:
+      - db
+
+volumes:
+  db_data:
+

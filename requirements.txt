@@ -1,0 +1,9 @@
+Flask
+Flask_SQLAlchemy
+Flask-Migrate
+psycopg2-binary
+paypalrestsdk
+pytest
+pytest-cov
+python-dotenv
+
