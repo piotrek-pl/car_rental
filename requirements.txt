@@ -6,4 +6,5 @@ paypalrestsdk
 pytest
 pytest-cov
 python-dotenv
-
+pika
+email-validator

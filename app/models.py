@@ -1,6 +1,7 @@
 from flask_sqlalchemy import SQLAlchemy
 from enum import Enum
 from datetime import datetime
+from sqlalchemy.orm import validates
 
 db = SQLAlchemy()
 
@@ -27,8 +28,8 @@ class Customer(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     first_name = db.Column(db.String(50), nullable=False)
     last_name = db.Column(db.String(50), nullable=False)
-    email = db.Column(db.String(120), unique=True, nullable=False)
-    phone = db.Column(db.String(20), unique=True, nullable=False)
+    email = db.Column(db.String(120), unique=False, nullable=False)
+    phone = db.Column(db.String(20), unique=False, nullable=False)
     rentals = db.relationship('Rental', backref='customer', lazy=True)
 
     def __repr__(self):
@@ -46,6 +47,12 @@ class Rental(db.Model):
     payment_status = db.Column(db.Enum(PaymentStatus), default=PaymentStatus.PENDING)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    @validates('end_date')
+    def validate_end_date(self, key, end_date):
+        if end_date and self.start_date and end_date < self.start_date:
+            raise ValueError("End date must be after start date")
+        return end_date
 
     def __repr__(self):
         return f'<Rental {self.id}>'

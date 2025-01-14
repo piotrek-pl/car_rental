@@ -1,13 +1,20 @@
-from flask import Blueprint, request, jsonify, url_for, redirect
+from flask import Blueprint, request, jsonify, url_for, redirect, abort
 import paypalrestsdk
 from datetime import datetime
+import logging
 from functools import wraps
 from .models import Car, Customer, Rental, PaymentStatus, db
 from sqlalchemy.exc import SQLAlchemyError
+from .messaging import send_to_queue
+import json 
+
+# Konfiguracja loggera
+logger = logging.getLogger(__name__)
 
 routes_bp = Blueprint('routes', __name__)
 
 def handle_transaction(f):
+    """Decorator do obsługi transakcji bazy danych"""
     @wraps(f)
     def decorated_function(*args, **kwargs):
         try:
@@ -16,29 +23,47 @@ def handle_transaction(f):
             return result
         except SQLAlchemyError as e:
             db.session.rollback()
-            return jsonify({"error": "Database error", "details": str(e)}), 500
+            response = jsonify({
+                "error": "Blad bazy danych",
+                "details": str(e)
+            })
+            response.headers["Content-Type"] = "application/json; charset=utf-8"
+            return response, 500
         except Exception as e:
             db.session.rollback()
-            return jsonify({"error": "Unexpected error", "details": str(e)}), 500
+            response = jsonify({
+                "error": "Nieoczekiwany blad",
+                "details": str(e)
+            })
+            response.headers["Content-Type"] = "application/json; charset=utf-8"
+            return response, 500
     return decorated_function
 
 @routes_bp.route('/test', methods=['GET'])
 def test():
-    return jsonify({"message": "Blueprint działa poprawnie!"})
+    """Endpoint testowy"""
+    return jsonify({"message": "Blueprint dziala poprawnie!"})
 
 @routes_bp.route('/rentals/create', methods=['POST'])
 @handle_transaction
 def create_rental_with_payment():
+    """Tworzenie rezerwacji z płatnością PayPal"""
     try:
         data = request.json
-        print("Received data:", data)  # Debug log
+        logger.info(f"Otrzymano dane rezerwacji: {data}")  # Dodatkowe logowanie
         
-        car = Car.query.get_or_404(data['car_id'])
-        print("Found car:", car)  # Debug log
-        
-        if not car.is_available:
-            return jsonify({"error": "Car is not available"}), 400
+        # Sprawdzenie samochodu
+        car = db.session.get(Car, data['car_id'])
+        if not car:
+            return jsonify({"error": "Samochod nie znaleziony"}), 404
+        logger.info(f"Znaleziono samochod: {car}")
 
+        # Sprawdzenie dostępności samochodu
+        if not car.is_available:
+            logger.warning(f"Samochod {car.id} jest niedostepny")
+            return jsonify({"error": "Samochod nie jest dostepny"}), 400
+
+        # Tworzenie płatności PayPal
         payment = paypalrestsdk.Payment({
             "intent": "sale",
             "payer": {
@@ -49,7 +74,7 @@ def create_rental_with_payment():
                     "total": str(data['total_amount']),
                     "currency": "USD"
                 },
-                "description": f"Car Rental: {car.make} {car.model}"
+                "description": f"Wynajem samochodu: {car.make} {car.model}"
             }],
             "redirect_urls": {
                 "return_url": url_for('routes.complete_rental', _external=True),
@@ -57,14 +82,21 @@ def create_rental_with_payment():
             }
         })
 
+        # Próba utworzenia płatności
         if not payment.create():
-            print("Payment creation failed:", payment.error)  # Debug log
+            logger.error(f"Nie udalo sie utworzyc patnosci: {payment.error}")
             return jsonify({"error": payment.error}), 400
 
-        print("Payment created:", payment.id)  # Debug log
+        logger.info(f"Utworzono płatnosc: {payment.id}")
 
+        # Oznaczenie samochodu jako niedostępnego
         car.is_available = False
         db.session.add(car)
+
+        # Tworzenie rekordu rezerwacji
+        customer = db.session.get(Customer, data['customer_id'])
+        if not customer:
+            return jsonify({"error": "Klient nie znaleziony"}), 404
 
         rental = Rental(
             car_id=data['car_id'],
@@ -78,61 +110,117 @@ def create_rental_with_payment():
         
         db.session.add(rental)
         db.session.flush()
-        print("Created rental:", rental.id)  # Debug log
+        logger.info(f"Utworzono rezerwacje: {rental.id}")
+
+        # Przygotowanie powiadomienia
+        notification = {
+            "type": "new_rental",
+            "customer_email": customer.email,
+            "customer_name": f"{customer.first_name} {customer.last_name}",
+            "customer_phone": customer.phone,
+            "car_id": car.id,
+            "car_details": f"{car.make} {car.model}",
+            "car_year": car.year,
+            "start_date": data['start_date'],
+            "end_date": data['end_date'],
+            "total_amount": str(data['total_amount']),
+            "created_at": datetime.utcnow().isoformat(),
+            "rental_id": rental.id
+        }
         
+        # Wysłanie powiadomienia do kolejki
+        logger.info(f"Proba wysłania powiadomienia: {notification}")
+        try:
+            send_result = send_to_queue(notification)
+            logger.info(f"Wyslanie powiadomienia zakonczone: {send_result}")
+        except Exception as e:
+            logger.error(f"Blad podczas wysyłania powiadomienia: {e}")
+        
+        # Pobranie adresu przekierowania
         redirect_url = next(link.href for link in payment.links if link.method == "REDIRECT")
         
         return jsonify({
-            "message": "Rental created successfully",
+            "message": "Rezerwacja utworzona pomyslnie",
             "rental_id": rental.id,
             "redirect_url": redirect_url,
-            "payment_id": payment.id  # Dodane dla debugowania
+            "payment_id": payment.id
         }), 201
 
     except Exception as e:
-        print("Error occurred:", str(e))  # Debug log
+        logger.error(f"Blad podczas tworzenia rezerwacji: {str(e)}")
         db.session.rollback()
         return jsonify({"error": str(e)}), 500
 
 @routes_bp.route('/rentals/complete', methods=['GET'])
 @handle_transaction
 def complete_rental():
+    """Zakończenie rezerwacji po udanej płatności"""
     payment_id = request.args.get('paymentId')
     payer_id = request.args.get('PayerID')
     
     try:
-        rental = Rental.query.filter_by(payment_id=payment_id).first_or_404()
+        # Znajdź rezerwację po ID płatności
+        rental = Rental.query.filter_by(payment_id=payment_id).first()
+        if not rental:
+            abort(404) 
         
+        # Wykonaj płatność PayPal
         payment = paypalrestsdk.Payment.find(payment_id)
         if not payment.execute({"payer_id": payer_id}):
+            # Jeśli płatność się nie powiodła
             rental.payment_status = PaymentStatus.FAILED
-            car = Car.query.get(rental.car_id)
+            car = db.session.get(Car, rental.car_id)
             car.is_available = True
-            return jsonify({"error": "Payment execution failed"}), 400
 
+            # Powiadomienie o nieudanej płatności
+            customer = db.session.get(Customer, rental.customer_id)
+            notification = {
+                "type": "payment_failed",
+                "rental_id": rental.id,
+                "customer_email": customer.email,
+                "customer_name": f"{customer.first_name} {customer.last_name}"
+            }
+            send_to_queue(notification)
+            
+            return jsonify({"error": "Wykonanie platnosci nie powiodlo sie"}), 400
+
+        # Oznacz rezerwację jako opłaconą
         rental.payment_status = PaymentStatus.COMPLETED
         
+        # Powiadomienie o udanej płatności
+        customer = db.session.get(Customer, rental.customer_id)
+        notification = {
+            "type": "payment_completed",
+            "rental_id": rental.id,
+            "customer_email": customer.email,
+            "customer_name": f"{customer.first_name} {customer.last_name}"
+        }
+        send_to_queue(notification)
+        
         return jsonify({
-            "message": "Payment completed successfully",
+            "message": "Platnosc zakonczona sukcesem",
             "rental_id": rental.id,
             "status": "COMPLETED"
         })
 
     except Exception as e:
-        print("Error in complete_rental:", str(e))  # Debug log
+        logger.error(f"Blad w complete_rental: {str(e)}")
         db.session.rollback()
         return jsonify({"error": str(e)}), 500
 
 @routes_bp.route('/rentals/<int:rental_id>/cancel', methods=['POST'])
 @handle_transaction
 def cancel_rental_by_id(rental_id):
+    """Anulowanie rezerwacji o konkretnym ID"""
     try:
-        rental = Rental.query.get_or_404(rental_id)
+        rental = db.session.get(Rental, rental_id)
+        if not rental:
+            abort(404)
         
-        # Sprawdź czy rezerwacja nie jest już anulowana
+        # Sprawdź status rezerwacji
         if rental.payment_status == PaymentStatus.CANCELLED:
             return jsonify({
-                "message": "Rental is already cancelled",
+                "message": "Rezerwacja jest juz anulowana",
                 "rental_id": rental.id,
                 "status": rental.payment_status.value
             }), 400
@@ -140,32 +228,46 @@ def cancel_rental_by_id(rental_id):
         # Sprawdź czy rezerwacja nie jest już zakończona
         if rental.payment_status == PaymentStatus.COMPLETED:
             return jsonify({
-                "message": "Cannot cancel completed rental",
+                "message": "Nie mozna anulowac zakonczonej rezerwacji",
                 "rental_id": rental.id,
                 "status": rental.payment_status.value
             }), 400
             
+        # Zmień status rezerwacji
         rental.payment_status = PaymentStatus.CANCELLED
         
-        car = Car.query.get(rental.car_id)
+        # Przywróć dostępność samochodu
+        car = db.session.get(Car, rental.car_id)
         if car:
             car.is_available = True
+
+        # Powiadomienie o anulowaniu rezerwacji
+        customer = db.session.get(Customer, rental.customer_id)
+        notification = {
+            "type": "rental_cancelled",
+            "rental_id": rental.id,
+            "customer_email": customer.email,
+            "customer_name": f"{customer.first_name} {customer.last_name}"
+        }
+        send_to_queue(notification)
             
         return jsonify({
-            "message": "Rental cancelled successfully",
+            "message": "Rezerwacja anulowana pomyslnie",
             "rental_id": rental.id,
             "status": "CANCELLED"
         })
     except Exception as e:
+        logger.error(f"Blad podczas anulowania rezerwacji: {str(e)}")
         return jsonify({"error": str(e)}), 500
 
 @routes_bp.route('/rentals/cancel', methods=['GET'])
 @handle_transaction
 def cancel_rental():
+    """Anulowanie rezerwacji z poziomu płatności"""
     token = request.args.get('token')  # Token from PayPal
     payment_id = request.args.get('paymentId')  # PayPal Payment ID
     
-    print("Cancellation request - token:", token, "payment_id:", payment_id)  # Debug log
+    logger.info(f"Zadanie anulowania - token: {token}, payment_id: {payment_id}")
     
     try:
         # Spróbuj znaleźć rezerwację po payment_id
@@ -176,12 +278,11 @@ def cancel_rental():
             rental = Rental.query.filter_by(payment_id=payment_id).first()
             
         if not rental:
-            return jsonify({"error": "Rental not found"}), 404
-            
-        # Sprawdź czy rezerwacja nie jest już anulowana
+            abort(404) 
+        # Sprawdź status rezerwacji
         if rental.payment_status == PaymentStatus.CANCELLED:
             return jsonify({
-                "message": "Rental is already cancelled",
+                "message": "Rezerwacja jest juz anulowana",
                 "rental_id": rental.id,
                 "status": rental.payment_status.value
             }), 400
@@ -189,37 +290,44 @@ def cancel_rental():
         # Sprawdź czy rezerwacja nie jest już zakończona
         if rental.payment_status == PaymentStatus.COMPLETED:
             return jsonify({
-                "message": "Cannot cancel completed rental",
+                "message": "Nie można anulowac zakonczonej rezerwacji",
                 "rental_id": rental.id,
                 "status": rental.payment_status.value
             }), 400
             
-        print("Found rental:", rental.id)  # Debug log
-        
+        # Zmień status rezerwacji
         rental.payment_status = PaymentStatus.CANCELLED
         
-        car = Car.query.get(rental.car_id)
+        # Przywróć dostępność samochodu
+        car = db.session.get(Car, rental.car_id)
         if car:
             car.is_available = True
-            print(f"Car {car.id} marked as available")  # Debug log
+            logger.info(f"Samochod {car.id} oznaczony jako dostepny")
+
+        # Powiadomienie o anulowaniu rezerwacji
+        customer = db.session.get(Customer, rental.customer_id)
+        notification = {
+            "type": "rental_cancelled",
+            "rental_id": rental.id,
+            "customer_email": customer.email,
+            "customer_name": f"{customer.first_name} {customer.last_name}"
+        }
+        send_to_queue(notification)
         
         return jsonify({
-            "message": "Rental cancelled successfully",
+            "message": "Rezerwacja anulowana pomyslnie",
             "rental_id": rental.id,
             "status": "CANCELLED"
         })
 
     except Exception as e:
-        print("Error in cancel_rental:", str(e))  # Debug log
+        logger.error(f"Blad w cancel_rental: {str(e)}")
         db.session.rollback()
         return jsonify({"error": str(e)}), 500
 
-# Standardowe endpointy dla samochodów
 @routes_bp.route('/cars', methods=['GET'])
 def get_cars():
-    """
-    Pobieranie listy wszystkich samochodów.
-    """
+    """Pobieranie listy wszystkich samochodów"""
     cars = Car.query.all()
     return jsonify([{
         "id": car.id, 
@@ -232,9 +340,7 @@ def get_cars():
 @routes_bp.route('/cars', methods=['POST'])
 @handle_transaction
 def add_car():
-    """
-    Dodawanie nowego samochodu.
-    """
+    """Dodawanie nowego samochodu"""
     data = request.json
     car = Car(
         make=data['make'], 
@@ -244,7 +350,7 @@ def add_car():
     )
     db.session.add(car)
     return jsonify({
-        "message": "Car added successfully!",
+        "message": "Samochod dodany pomyslnie!",
         "car": {
             "id": car.id,
             "make": car.make,
@@ -257,19 +363,14 @@ def add_car():
 @routes_bp.route('/cars/<int:car_id>', methods=['DELETE'])
 @handle_transaction
 def delete_car(car_id):
-    """
-    Usuwanie samochodu.
-    """
+    """Usuwanie samochodu"""
     car = Car.query.get_or_404(car_id)
     db.session.delete(car)
-    return jsonify({"message": "Car deleted successfully!"})
+    return jsonify({"message": "Samochod usuniety pomyslnie!"})
 
-# Standardowe endpointy dla klientów
 @routes_bp.route('/customers', methods=['GET'])
 def get_customers():
-    """
-    Pobieranie listy wszystkich klientów.
-    """
+    """Pobieranie listy wszystkich klientów"""
     customers = Customer.query.all()
     return jsonify([{
         "id": customer.id,
@@ -282,9 +383,7 @@ def get_customers():
 @routes_bp.route('/customers', methods=['POST'])
 @handle_transaction
 def add_customer():
-    """
-    Dodawanie nowego klienta.
-    """
+    """Dodawanie nowego klienta"""
     data = request.json
     customer = Customer(
         first_name=data['first_name'],
@@ -294,7 +393,7 @@ def add_customer():
     )
     db.session.add(customer)
     return jsonify({
-        "message": "Customer added successfully!",
+        "message": "Klient dodany pomyslnie!",
         "customer": {
             "id": customer.id,
             "first_name": customer.first_name,
@@ -304,11 +403,13 @@ def add_customer():
         }
     }), 201
 
-# Endpoint do sprawdzania statusu
 @routes_bp.route('/rentals/<int:rental_id>/status', methods=['GET'])
 def get_rental_status(rental_id):
+    """Sprawdzenie statusu rezerwacji"""
     try:
-        rental = Rental.query.get_or_404(rental_id)
+        rental = db.session.get(Rental, rental_id)
+        if not rental:
+            abort(404) 
         return jsonify({
             "rental_id": rental.id,
             "payment_id": rental.payment_id,
@@ -316,14 +417,12 @@ def get_rental_status(rental_id):
             "car_id": rental.car_id
         })
     except Exception as e:
+        logger.error(f"Blad podczas pobierania statusu rezerwacji: {str(e)}")
         return jsonify({"error": str(e)}), 500
 
-# Endpoint do pobierania wszystkich rezerwacji
 @routes_bp.route('/rentals', methods=['GET'])
 def get_rentals():
-    """
-    Pobieranie listy wszystkich rezerwacji.
-    """
+    """Pobieranie listy wszystkich rezerwacji"""
     rentals = Rental.query.all()
     return jsonify([{
         "id": rental.id,
